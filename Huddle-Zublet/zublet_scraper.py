@@ -1,93 +1,204 @@
-from playwright.sync_api import sync_playwright
+import hashlib
 import json
 import time
+import requests
 
-def scrape_zublet():
-    listings = []
-    seen = set()
+# ======================
+# CONFIG
+# ======================
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
+UNIVERSITY_ID = "purdue"
+SOURCE_TYPE = "zublet"
 
-        # Go to Zublet homepage
-        page.goto("https://zublet.com", timeout=60000)
+BASE_URL = "https://zublet-production.up.railway.app/listings/location/purdue"
 
-        # Wait for listings to load
-        page.wait_for_timeout(5000)
 
-        # Scroll to ensure all cards load
-        for _ in range(5):
-            page.mouse.wheel(0, 2000)
-            time.sleep(1)
+# ======================
+# UTILS
+# ======================
 
-        # Grab all potential listing cards
-        cards = page.locator("a, div").all()
+def md5_text(text: str) -> str:
+    return hashlib.md5(text.encode("utf-8")).hexdigest()
 
-        for card in cards:
-            try:
-                text = card.inner_text().strip()
 
-                # Skip non-listing blocks
-                if "$" not in text:
-                    continue
+def safe_json_response(resp: requests.Response):
+    try:
+        return resp.json()
+    except Exception:
+        return None
 
-                lines = [l.strip() for l in text.split("\n") if l.strip()]
 
-                if len(lines) < 2:
-                    continue
+# ======================
+# EXTRACTION (NEW 🔥)
+# ======================
 
-                # Basic parsing
-                price = None
-                title = None
-                location = None
+def extract_amenities_and_utilities(item):
+    amenities = set()
+    utilities = set()
 
-                for i, line in enumerate(lines):
-                    if "$" in line:
-                        price = line
-                        if i >= 1:
-                            location = lines[i-1]
-                        if i >= 2:
-                            title = lines[i-2]
-                        break
+    desc = (item.get("description") or "").lower()
 
-                if not price or not title:
-                    continue
+    # -------- API fields --------
+    if item.get("furnished"):
+        amenities.add("furnished")
 
-                key = (title, location, price)
+    if item.get("laundry"):
+        amenities.add("laundry")
 
-                if key in seen:
-                    continue
+    if item.get("parkingType"):
+        amenities.add("parking")
 
-                seen.add(key)
+    if item.get("petsAllowed") is True:
+        amenities.add("pets allowed")
+    elif item.get("petsAllowed") is False:
+        amenities.add("pets not allowed")
 
-                # Try to get link if exists
-                url = ""
-                try:
-                    url = card.get_attribute("href") or ""
-                except:
-                    pass
+    # -------- TEXT extraction --------
+    if "wifi" in desc or "wi-fi" in desc or "internet" in desc:
+        amenities.add("wifi")
+        utilities.add("wifi")
 
-                listings.append({
-                    "title": title,
-                    "location": location or "",
-                    "price": price,
-                    "url": url,
-                    "source": "zublet"
+    if "gym" in desc:
+        amenities.add("gym")
+
+    if "pool" in desc:
+        amenities.add("pool")
+
+    if "parking" in desc:
+        amenities.add("parking")
+
+    if "laundry" in desc or "washer" in desc or "dryer" in desc:
+        amenities.add("laundry")
+
+    if "furnished" in desc:
+        amenities.add("furnished")
+
+    if "utilities included" in desc or "all utilities" in desc:
+        utilities.add("utilities included")
+
+    if "water" in desc:
+        utilities.add("water")
+
+    if "electricity" in desc:
+        utilities.add("electricity")
+
+    if "gas" in desc:
+        utilities.add("gas")
+
+    return list(amenities), list(utilities)
+
+
+# ======================
+# CORE API FETCH
+# ======================
+
+def fetch_zublet_api():
+    all_listings = []
+
+    offset = 0
+    limit = 50
+
+    while True:
+        params = {
+            "limit": limit,
+            "offset": offset,
+            "sort": "RECENT"
+        }
+
+        try:
+            resp = requests.get(
+                BASE_URL,
+                params=params,
+                headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "Accept": "application/json"
+                },
+                timeout=10
+            )
+
+            data = safe_json_response(resp)
+
+            if not data or "listings" not in data:
+                print("Invalid response")
+                break
+
+            listings = data["listings"]
+
+            if not listings:
+                print("No more listings")
+                break
+
+            for item in listings:
+                amenities, utilities = extract_amenities_and_utilities(item)
+
+                duplicate_group_id = md5_text(
+                    f"{item.get('id')}|{item.get('startDate')}|{item.get('endDate')}"
+                )
+
+                all_listings.append({
+                    "id": item.get("id"),
+
+                    "universityId": UNIVERSITY_ID,
+                    "sourceType": SOURCE_TYPE,
+
+                    # treat everything as sublease for consistency
+                    "listingCategory": "sublease",
+
+                    "title": f"{item.get('address')} | {item.get('totalRooms')} Bedroom"
+                             if item.get("address") else "Zublet Listing",
+
+                    "description": item.get("description"),
+
+                    "price": item.get("monthlyPrice"),
+
+                    "bedsCount": item.get("totalRooms"),
+                    "bathsCount": item.get("numBathrooms"),
+
+                    # ✅ correct geo
+                    "address": item.get("address"),
+                    "latitude": item.get("latitude"),
+                    "longitude": item.get("longitude"),
+
+                    "leaseStart": item.get("startDate"),
+                    "leaseEnd": item.get("endDate"),
+
+                    "negotiable": None,
+
+                    "genderRestriction": item.get("preferredTenantGender"),
+
+                    # 🔥 now populated
+                    "utilities": utilities,
+                    "amenities": amenities,
+
+                    "status": "active" if item.get("active") else "inactive",
+
+                    "expiresAt": item.get("endDate"),
+
+                    "duplicateGroupId": duplicate_group_id,
                 })
 
-            except:
-                continue
+            print(f"Fetched {len(listings)} listings (offset={offset})")
 
-        browser.close()
+            offset += limit
+            time.sleep(0.2)
 
-    return listings
+        except Exception as e:
+            print(f"API ERROR: {e}")
+            break
+
+    return all_listings
 
 
-# Run scraper
-data = scrape_zublet()
+# ======================
+# MAIN
+# ======================
 
-with open("zublet_data.json", "w") as f:
-    json.dump(data, f, indent=2)
+if __name__ == "__main__":
+    print("Running Zublet API ingestion...")
 
-print(f"Saved {len(data)} listings")
+    listings = fetch_zublet_api()
+
+    with open("zublet_final.json", "w", encoding="utf-8") as f:
+        json.dump(listings, f, indent=2, ensure_ascii=False)
+
+    print(f"Saved {len(listings)} listings to zublet_final.json")

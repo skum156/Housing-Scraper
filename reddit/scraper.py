@@ -9,9 +9,7 @@ import praw
 from tqdm import tqdm
 import re
 
-# -------------------------
-# 🔧 Setup and Authentication
-# -------------------------
+
 load_dotenv()
 logging.basicConfig(
     filename="pipeline.log",
